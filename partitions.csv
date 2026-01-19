@@ -1,0 +1,8 @@
+# 4 MB layout for the desk clock.
+# Default 1 MB app partition is too small once LVGL + Bluedroid + the 48 px
+# font are linked in (image comes out around 1.5 MB), so give the app 3 MB.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x300000,
