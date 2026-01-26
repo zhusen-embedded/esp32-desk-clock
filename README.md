@@ -1,61 +1,109 @@
-# 智能桌面时钟环境屏
+# 桌面时钟环境屏
 
-ESP32-S3 + 2.4 寸 ST7789 (240×320) + LVGL 9，三页面滑动切换，SNTP 校时 + 天气，BLE 配网，背光 PWM 调光与夜间熄屏。
+ESP32-S3 + 2.4 寸 ST7789 屏，LVGL 9，三个页面左右滑，能看时间、天气，第一次用手机 BLE 配网，晚上自动暗屏。
 
-> 状态：代码已完成并通过 `idf.py build`（ESP-IDF v5.5 + LVGL 9.6，esp32s3）。
-> 「实测指标」区分**代码可验证**（由实现直接决定）与**硬件实测**（需上板测，标了「待实测」）。
+本来是想做个能放桌上的东西，顺便把 LVGL 摸熟。做着做着发现坑比想象的多，尤其 LVGL 从 8 换到 9 之后 API 全变了，网上的教程一大半还是 8 的，照着抄编译不过。
 
-## 指标
+## 硬件
 
-| 项目 | 结果 | 类型 |
-|---|---|---|
-| 屏幕 | 2.4 寸 ST7789，240×320，SPI 40 MHz | 代码可验证 |
-| 缓冲 | 双缓冲，每块 240×40 行 RGB565（19.2 KB/块） | 代码可验证 |
-| 帧率 | 理论上限约 30 FPS（40 MHz SPI，40 行/块） | 待实测 |
-| 待机功耗 | 待实测 | 硬件实测 |
-| 配网 | BLE 自定义 GATT，写 `SSID:密码` 到 FF01 特征值 | 代码可验证 |
-| 固件体积 | 1.53 MB（app 分区 3 MB，占 49%） | 编译输出 |
+- ESP32-S3 开发板（N16R8，带 8 MB PSRAM，其实用不完）
+- 2.4 寸 ST7789 屏，240×320，SPI 接口，淘宝二十来块
+- 连线：MOSI=11 SCLK=12 CS=10 DC=9 RST=8 BL=5
+
+屏幕是 BGR 不是 RGB，一开始红色显示成蓝色，查了半天以为是排线接错了。
+
+## 能干什么
+
+- 表盘页：时间 + 日期 + 联网状态
+- 天气页：温度和天气，数据从 HTTP 接口拉
+- 设置页：背光滑条，拖了立刻生效
+- 左右滑动切页
+- 22:00~07:00 背光自动降到 10%
 
 ## 目录
 
 ```
 main/
-  main.c      LVGL 互斥锁 + 三个任务（lvgl/clock/weather_ui）
-  display.c   ST7789 初始化 + 双缓冲 + DMA 完成回调 + 背光 PWM
-  ui.c        三页面（表盘/天气/设置）+ 手势回调
-  net_time.c  SNTP + 天气 HTTP（分块攒包后整体解析）
-  ble_prov.c  BLE 配网 GATT 服务
-partitions.csv  单 app 分区 3 MB
-sdkconfig.defaults
+  main.c        LVGL 锁 + 三个任务
+  display.c     ST7789 初始化、双缓冲、背光 PWM
+  ui.c          三个页面和手势
+  net_time.c    SNTP 校时 + 拉天气
+  ble_prov.c    BLE 配网
 ```
 
 ## 编译
 
 ```bash
-# 注意路径不要含中文，xtensa objdump 读不了中文路径
 idf.py set-target esp32s3
 idf.py build
 ```
 
-## 原实现里的四个真 bug
+⚠️ **工程路径不能有中文**。我一开始放在「找实习/简历/plans/」下面，编到 90% 的时候 ldgen 报错：
 
-这一版是把仓库从「能看出是骨架」修到「能编译、逻辑自洽」的过程记录，四条都是实际踩到的：
+```
+xtensa-esp32-elf-objdump.exe: .../libxtensa.a: No such file or directory
+```
 
-### 1. LVGL 双缓冲是假的
+objdump 读不了中文路径，但 ninja 传给它的路径是 UTF-8，Windows 上就炸了。折腾了一晚上，最后把工程复制到 `C:\idfwork\` 才编过去。CMake 生成的 build 目录会记住绝对路径，所以复制完得先删 build 重新配。
 
-原 `flush_cb` 调完 `esp_lcd_panel_draw_bitmap` 立刻 `lv_disp_flush_ready`，
-DMA 还在传就把缓冲还给 LVGL 了，双缓冲退化成单缓冲，滑动时照样撕裂。
+固件编出来 1.53 MB。默认 1 MB 的 app 分区直接放不下（`app partition is too small for binary`），改成分区表给 3 MB。
 
-修法：`on_color_trans_done` 回调里 give 信号量，`flush_cb` 等信号量再 ready。
+## 踩坑记录
 
-### 2. LVGL 没有线程保护
+按折腾的时间顺序写的，有些坑现在回头看挺蠢。
 
-原实现只有 `lvgl_task` 里调 `lv_timer_handler`，业务任务直接改控件。
-LVGL 不是线程安全的，双核上偶发花屏/重启就是这个原因。
+### LVGL 双缓冲是假的
 
-修法：加互斥锁，所有 `lv_*` 调用包在 `ui_lock()/ui_unlock()` 里。
+这个最坑，因为现象很隐蔽——能跑，但滑动的时候上下半屏错位。
 
-### 3. 手势切换等于没切
+`flush_cb` 里我一开始是这么写的：
+
+```c
+esp_lcd_panel_draw_bitmap(s_panel, ..., color);
+lv_disp_flush_ready(drv);          // 立刻告诉 LVGL 我画完了
+```
+
+`draw_bitmap` 只是把数据丢给 DMA，函数返回的时候 SPI 还在传。这时候 `flush_ready` 一调，LVGL 就认为这块缓冲空了，拿去做下一帧——DMA 还在读同一块内存，画面就花了。
+
+后来看 IDF 的 lcd 例程才发现要用 `on_color_trans_done` 回调。改成：
+
+```c
+// 注册 io 的时候挂上
+.on_color_trans_done = on_color_trans_done,
+
+// 回调里给信号量
+static bool on_color_trans_done(...) {
+    xSemaphoreGiveFromISR(s_flush_done, &need_yield);
+}
+
+// flush_cb 里等它
+esp_lcd_panel_draw_bitmap(...);
+xSemaphoreTake(s_flush_done, portMAX_DELAY);
+lv_display_flush_ready(disp);
+```
+
+改完才真的是双缓冲。
+
+### LVGL 不加锁会随机重启
+
+一开始只有一个任务在调 `lv_timer_handler`，我想着「那不就只有一个线程碰 LVGL 吗」，业务代码里就直接改控件了（`lv_label_set_text` 这些）。
+
+结果跑十几分钟就花屏一次，偶尔直接重启。查了很久，最后在 LVGL 文档里看到一句：**LVGL 不是线程安全的**。`lv_timer_handler` 在渲染的时候，另一个任务改控件，内部链表就乱了。
+
+加了把互斥锁，所有 `lv_*` 调用都包起来：
+
+```c
+if (ui_lock(100)) {
+    lv_label_set_text(s_lbl_time, buf);
+    ui_unlock();
+}
+```
+
+`lvgl_task` 里也是先拿锁再 `lv_timer_handler`。改完跑了一下午没再花屏。
+
+顺带说，`lv_timer_handler` 的返回值是「下次该多久以后再调」，我原来固定 `vTaskDelay(5)`，现在按返回值睡，限制在 5~20 ms 之间。
+
+### 手势切换其实什么都没干
 
 原代码：
 
@@ -63,35 +111,81 @@ LVGL 不是线程安全的，双核上偶发花屏/重启就是这个原因。
 lv_scr_load_anim(lv_scr_act(), LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
 ```
 
-`lv_scr_act()` 是当前屏，拿当前屏当目标加载，等于原地打转。
+`lv_scr_act()` 拿的是**当前**屏幕，然后让当前屏幕动画切到当前屏幕……等于原地打转。当时还以为动画参数没配对。
 
-修法：三个页面做成独立 `lv_obj`，切换时只改 `LV_OBJ_FLAG_HIDDEN`，
-不重建控件，也不依赖 `lv_scr_load`。
+改成三个独立 `lv_obj` 叠在根屏上，切页只改 `LV_OBJ_FLAG_HIDDEN`：
 
-### 4. 天气 JSON 必然解析失败
+```c
+static void show_page(ui_page_t p) {
+    for (int i = 0; i < UI_PAGE_NUM; i++) {
+        if ((ui_page_t)i == p) lv_obj_clear_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
+        else                   lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+```
 
-原实现每收到一段 `HTTP_EVENT_ON_DATA` 就 `cJSON_ParseWithLength` 一次。
-TCP 会把响应拆成多段，单段必然不是完整 JSON。
+这样也不用每次切页重建控件，省内存。
 
-修法：先攒到缓冲区，`HTTP_EVENT_ON_FINISH` 再整体解析。
+### 天气 JSON 永远解析失败
 
-## 其他改动
+`esp_http_client` 的 `HTTP_EVENT_ON_DATA` 是分块回调的，TCP 收到多少给多少。我一开始在里面直接 `cJSON_ParseWithLength(evt->data, evt->data_len)`，想着「一段就是一个 JSON 吧」。
 
-- **LVGL 8 → 9 API 迁移**：`lv_disp_drv_t`/`lv_disp_draw_buf_t` 已被移除，
-  改用 `lv_display_create()` + `lv_display_set_buffers()` + `lv_display_set_flush_cb()`。
-- **背光 PWM**：LEDC 10 bit，5 kHz，`display_set_backlight(percent)`。
-- **夜间熄屏**：22:00~07:00 背光降到 10%，由 `clock_task` 每秒判断。
-- **BLE 配网补全**：原代码只调了 `esp_ble_gap_config_adv_data` 就结束，
-  没有 GATTS 服务、没有写入处理、没有 NVS 持久化。现在是一套完整流程：
-  注册服务 → 手机写入 → 存 NVS → 关 BLE 省电 → 下次上电直接连。
-- **SNTP 判定**：原实现轮询 `sntp_get_sync_status()`，POLL 模式下完成瞬间可能被重置，
-  出现「明明同步了却报超时」。改用 `set_time_sync_notification_cb` 回调标志。
+当然不是。响应被拆成好几段，每段单独解析必然失败。改成先攒到一个缓冲区，`HTTP_EVENT_ON_FINISH` 再整体解析。
 
-## 待实测项
+### SNTP 明明同步了却报超时
 
-上板后需要补的数字（README 里没写的都不算）：
+判断校时成功我用的是轮询：
 
-- 实际帧率（`lv_timer_handler` 返回值和帧计数器）
-- 待机功耗（背光 10% + Wi-Fi modem sleep）
-- BLE 配网到 Wi-Fi 连上的耗时
-- 连续运行 72 h 内存占用曲线（看有没有 LVGL 内存泄漏）
+```c
+while (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED && retry++ < 20) { ... }
+```
+
+但 POLL 模式下这个状态在完成瞬间可能被重置，就出现「日志里明明有同步成功的打印，但我的代码判定超时」。
+
+改用 `esp_sntp_set_time_sync_notification_cb` 注册回调，在回调里置标志位，轮询这个标志。
+
+### BLE 配网原来只配了一半
+
+一开始只写了这几行就以为完事了：
+
+```c
+esp_ble_gap_config_adv_data(&adv);
+```
+
+这行只是设置广播数据，手机能搜到设备，但连上之后没有任何服务，发不了 SSID 和密码。要完整跑通得注册 GATTS 服务、加特征值、处理写入事件、存 NVS。
+
+现在的流程：注册 128 位服务 0xFF00 → 特征值 FF01（手机写入 `SSID:密码`）→ 解析后存 NVS → 回调通知上层 → 下次上电 `ble_prov_load` 直接读出来跳过配网。
+
+配网成功后会关掉 BLE 省电（`esp_bt_controller_disable`）。
+
+## LVGL 8 升 9
+
+这块单独说一下，因为改得挺多。9 把 display 相关的 API 全换了：
+
+| 8.x | 9.x |
+|---|---|
+| `lv_disp_drv_t` + `lv_disp_drv_init` | `lv_display_create()` |
+| `lv_disp_draw_buf_init` | `lv_display_set_buffers()` |
+| `disp_drv.flush_cb = ...` | `lv_display_set_flush_cb()` |
+| `lv_disp_drv_register` | 不需要，create 时就注册了 |
+
+`lv_disp_draw_buf_t` 直接删了。缓冲区改成自己 `spi_bus_dma_memory_alloc` 分配，保证 DMA 能访问。
+
+`lv_font_montserrat_48` 这些字体要在 `menuconfig` 里手动打开（`CONFIG_LV_FONT_MONTSERRAT_48`），默认只有 14 号。
+
+## 还没测的
+
+说实话这几个数我还没有：
+
+- **实际帧率**。README 里写 30 FPS 是按 40 MHz SPI 和 40 行缓冲区算出来的理论上限，实际没数过帧。要测得在 `lv_timer_handler` 里加计数器。
+- **待机功耗**。`docs/power.md` 里那张表是设计目标，不是实测。手上没有功率计，用万用表串在 5V 上量过大概 70 mA（背光 10% + Wi-Fi 睡眠），但没细测不同状态。
+- **配网耗时**。从手机点确认到 Wi-Fi 连上，体感五六秒，没掐表。
+- **长时间稳定性**。最多连续跑过一下午，没跑过 72 小时，LVGL 内存有没有缓慢泄漏不清楚。
+
+这些等以后有空补。有实测数据的项目才经得起问。
+
+## 下一步想做的
+
+- 天气接口现在写死了一个示例 URL，得换成真能用的
+- 想加个 RTC 备份电池，断网的时候也能走时
+- 触摸现在只支持手势，想在表盘上加个点击切换 12/24 小时制
